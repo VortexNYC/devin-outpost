@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { chooseStartSource, type StartSourceInput } from "../src/start-source";
+import {
+  chooseStartSource,
+  decideRestoreFallback,
+  type StartSourceInput,
+} from "../src/start-source";
 
 const base: StartSourceInput = {
   kind: "new",
@@ -58,5 +62,26 @@ describe("chooseStartSource", () => {
     expect(
       chooseStartSource({ ...base, kind: "fork", environmentSnapshotId: "env-1" }),
     ).toEqual({ source: "environment", snapshotId: "env-1" });
+  });
+});
+
+describe("decideRestoreFallback", () => {
+  it("a failed environment restore restarts from base and clears that snapshot id", () => {
+    expect(decideRestoreFallback("environment", "env-1")).toEqual({
+      restartFromBase: true,
+      clearEnvironmentSnapshotId: "env-1",
+    });
+  });
+
+  it("a failed session restore restarts from base but keeps the snapshot record", () => {
+    const decision = decideRestoreFallback("session", "sess-1");
+    expect(decision.restartFromBase).toBe(true);
+    expect(decision.skipSessionSnapshotId).toBe("sess-1");
+    // No clearEnvironmentSnapshotId: only the session's own id is skipped.
+    expect(decision.clearEnvironmentSnapshotId).toBeUndefined();
+  });
+
+  it("a failed base start has no fallback and must be rethrown", () => {
+    expect(decideRestoreFallback("base", undefined)).toEqual({ restartFromBase: false });
   });
 });

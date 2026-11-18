@@ -59,6 +59,8 @@ When Devin suspends a session, the Devin CLI exits. The entrypoint then writes a
 
 If the Devin CLI exits while the session is still `running`, the Durable Object snapshots the Container and starts a new one from the snapshot.
 
+Snapshots expire 30 days after creation or last restore. If a snapshot-based start fails during boot — the Container exits or errors within two minutes of `start()` — the Durable Object logs `devin.environment_image.restore_failed` or `devin.session.restore_failed`, drops the stale environment record (compare-and-clear, so a newer build wins) or skips the session snapshot id, and starts the session from the base image instead.
+
 A snapshot keeps files, installed packages, and Devin's state on disk. It does not keep running processes or memory. If a Container stops before its snapshot is saved, the session resumes from its previous snapshot or from the image.
 
 Terminating a session removes the snapshot ID from the Durable Object. The Worker API has no method to delete the snapshot itself.

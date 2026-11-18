@@ -34,3 +34,32 @@ export function chooseStartSource(input: StartSourceInput): StartSourceDecision 
   }
   return { source: "base" };
 }
+
+// What to do when a snapshot-based container dies or errors during its boot
+// window (container.start() only validates options; a missing or expired
+// snapshot surfaces later through monitor()). Cloudflare expires snapshots
+// after 30 days, so this is expected, not exceptional.
+export interface RestoreFallbackDecision {
+  // False means the start was already from the base image: the caller must
+  // rethrow — there is nothing to fall back to.
+  restartFromBase: boolean;
+  // Environment snapshots are shared, so a proven-bad id is cleared from
+  // EnvironmentImage (compare-and-clear on this exact id).
+  clearEnvironmentSnapshotId?: string;
+  // The session's own snapshot record is kept, but this id is skipped so the
+  // next ensureRunning boots base instead of retrying a dead snapshot.
+  skipSessionSnapshotId?: string;
+}
+
+export function decideRestoreFallback(
+  source: StartSource,
+  snapshotId: string | undefined,
+): RestoreFallbackDecision {
+  if (source === "environment") {
+    return { restartFromBase: true, clearEnvironmentSnapshotId: snapshotId };
+  }
+  if (source === "session") {
+    return { restartFromBase: true, skipSessionSnapshotId: snapshotId };
+  }
+  return { restartFromBase: false };
+}

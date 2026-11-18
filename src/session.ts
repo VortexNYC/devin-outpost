@@ -1,7 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
 import type { SessionSpec } from "./devin-api";
 import type { Env } from "./env";
-import { chooseStartSource } from "./start-source";
+import {
+  chooseStartSource,
+  decideRestoreFallback,
+  type RestoreFallbackDecision,
+  type StartSourceDecision,
+} from "./start-source";
 
 // The reconciler renews this on every poll, so it only matters after polling stops.
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1_000;
@@ -10,6 +15,14 @@ const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1_000;
 const EXIT_MARKER = "/var/lib/devin-outpost/exited";
 const SNAPSHOT_KEY = "snapshotId";
 const SESSION_META_KEY = "sessionMeta";
+// A session snapshot id whose restore already failed once; the record stays,
+// but ensureRunning skips it until a fresh snapshot replaces it.
+const FAILED_SNAPSHOT_KEY = "failedSnapshotId";
+// container.start() only validates options — a missing or expired snapshot
+// surfaces when the container fails during boot. The entrypoint sleeps
+// forever after the CLI exits, so a container that exits or errors this soon
+// after start() is a failed restore, not a finished session.
+const RESTORE_GRACE_MS = 120_000;
 
 // Removed before an environment snapshot is taken. The snapshot is shared by
 // every new session on the pool, so it must not carry credentials or
@@ -80,11 +93,11 @@ export class DevinSession extends DurableObject<Env> {
       });
     }
 
-    const sessionSnapshotId = await this.ctx.storage.get<string>(SNAPSHOT_KEY);
+    const sessionSnapshotId = await this.effectiveSessionSnapshotId();
     const environment = meta.imageBuild
       ? null
       : await this.env.ENVIRONMENT_IMAGE.getByName("current").current();
-    const decision = chooseStartSource({
+    let decision = chooseStartSource({
       kind: meta.kind,
       imageBuild: meta.imageBuild,
       sessionSnapshotId,
@@ -111,10 +124,26 @@ export class DevinSession extends DurableObject<Env> {
       enableInternet: true,
       env,
     } satisfies ContainerStartupOptions;
-    if (decision.source === "base") {
-      container.start({ ...options, image: container.images.devin });
-    } else {
-      container.start({ ...options, containerSnapshot: { id: decision.snapshotId } });
+    const baseOptions = { ...options, image: container.images.devin };
+    const snapshotOptions = (snapshotId: string) => ({
+      ...options,
+      containerSnapshot: { id: snapshotId },
+    });
+    const startOptions = (d: StartSourceDecision) =>
+      d.source === "base" ? baseOptions : snapshotOptions(d.snapshotId);
+
+    try {
+      container.start(startOptions(decision));
+    } catch (cause) {
+      const fallback = decideRestoreFallback(
+        decision.source,
+        decision.source === "base" ? undefined : decision.snapshotId,
+      );
+      if (!fallback.restartFromBase) throw cause;
+      await this.applyRestoreFallback(fallback, sessionId, describeError(cause));
+      decision = { source: "base" };
+      // A base-image start that also throws propagates — nothing left to try.
+      container.start(baseOptions);
     }
     await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
     console.log({
@@ -125,12 +154,105 @@ export class DevinSession extends DurableObject<Env> {
       imageBuild: meta.imageBuild,
       snapshotId: decision.source === "base" ? undefined : decision.snapshotId,
     });
-    this.ctx.waitUntil(
-      container.monitor().then(
-        () => console.log({ event: "devin.container.exited", sessionId }),
-        (cause: unknown) =>
-          console.warn({ event: "devin.container.exited", sessionId, error: describeError(cause) }),
+    this.ctx.waitUntil(this.watchContainer(container, sessionId, decision, baseOptions));
+  }
+
+  // The session's snapshot id unless a previous restore of it already failed.
+  private async effectiveSessionSnapshotId(): Promise<string | undefined> {
+    const stored = await this.ctx.storage.get<string>(SNAPSHOT_KEY);
+    if (stored === undefined) return undefined;
+    const failed = await this.ctx.storage.get<string>(FAILED_SNAPSHOT_KEY);
+    return stored === failed ? undefined : stored;
+  }
+
+  private async applyRestoreFallback(
+    fallback: RestoreFallbackDecision,
+    sessionId: string,
+    error: string,
+  ): Promise<void> {
+    if (fallback.clearEnvironmentSnapshotId !== undefined) {
+      await this.env
+        .ENVIRONMENT_IMAGE.getByName("current")
+        .clear(fallback.clearEnvironmentSnapshotId);
+      console.warn({
+        event: "devin.environment_image.restore_failed",
+        sessionId,
+        snapshotId: fallback.clearEnvironmentSnapshotId,
+        error,
+      });
+    }
+    if (fallback.skipSessionSnapshotId !== undefined) {
+      await this.ctx.storage.put(FAILED_SNAPSHOT_KEY, fallback.skipSessionSnapshotId);
+      console.warn({
+        event: "devin.session.restore_failed",
+        sessionId,
+        snapshotId: fallback.skipSessionSnapshotId,
+        error,
+      });
+    }
+  }
+
+  // A snapshot restore that cannot work fails while the container boots:
+  // monitor() settles (exit or error) inside RESTORE_GRACE_MS. In that case
+  // fall back to the base image once; a surviving container is healthy.
+  private async watchContainer(
+    container: Container,
+    sessionId: string,
+    decision: StartSourceDecision,
+    baseOptions: ContainerStartupOptions,
+  ): Promise<void> {
+    const monitor = container.monitor();
+    const settled = await Promise.race([
+      monitor.then(
+        () => ({ kind: "exited" as const }),
+        (cause: unknown) => ({ kind: "error" as const, cause }),
       ),
+      new Promise<{ kind: "alive" }>((resolve) =>
+        setTimeout(() => resolve({ kind: "alive" }), RESTORE_GRACE_MS),
+      ),
+    ]);
+
+    if (settled.kind !== "alive") {
+      const snapshotId = decision.source === "base" ? undefined : decision.snapshotId;
+      const fallback = decideRestoreFallback(decision.source, snapshotId);
+      if (fallback.restartFromBase) {
+        const error =
+          settled.kind === "error" ? describeError(settled.cause) : "container exited during boot";
+        await this.applyRestoreFallback(fallback, sessionId, error);
+        try {
+          container.start(baseOptions);
+        } catch {
+          // Another reconcile may already have restarted the container.
+        }
+        this.ctx.waitUntil(
+          container.monitor().then(
+            () => console.log({ event: "devin.container.exited", sessionId }),
+            (cause: unknown) =>
+              console.warn({
+                event: "devin.container.exited",
+                sessionId,
+                error: describeError(cause),
+              }),
+          ),
+        );
+        return;
+      }
+      if (settled.kind === "exited") {
+        console.log({ event: "devin.container.exited", sessionId });
+      } else {
+        console.warn({
+          event: "devin.container.exited",
+          sessionId,
+          error: describeError(settled.cause),
+        });
+      }
+      return;
+    }
+
+    monitor.then(
+      () => console.log({ event: "devin.container.exited", sessionId }),
+      (cause: unknown) =>
+        console.warn({ event: "devin.container.exited", sessionId, error: describeError(cause) }),
     );
   }
 
@@ -170,6 +292,7 @@ export class DevinSession extends DurableObject<Env> {
     } else {
       const snapshot = await container.snapshotContainer({ name: `devin-${sessionId}` });
       await this.ctx.storage.put(SNAPSHOT_KEY, snapshot.id);
+      await this.ctx.storage.delete(FAILED_SNAPSHOT_KEY);
       await container.destroy();
       console.log({
         event: "devin.snapshot.saved",

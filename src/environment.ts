@@ -27,4 +27,13 @@ export class EnvironmentImage extends DurableObject<Env> {
       buildSessionId: state.buildSessionId,
     });
   }
+
+  // Compare-and-clear: only drops the record when it still points at the
+  // snapshot that failed to restore, so a newer build's record survives.
+  async clear(snapshotId: string): Promise<void> {
+    const current = await this.ctx.storage.get<EnvironmentImageState>(STATE_KEY);
+    if (current?.snapshotId !== snapshotId) return;
+    await this.ctx.storage.delete(STATE_KEY);
+    console.log({ event: "devin.environment_image.cleared", snapshotId });
+  }
 }

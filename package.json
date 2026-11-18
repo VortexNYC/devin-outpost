@@ -2,7 +2,7 @@
   "name": "devin-outpost",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.25.0",
+  "packageManager": "pnpm@11.13.1",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
