@@ -57,6 +57,7 @@ export async function listOutpostSessions(env: Env): Promise<OutpostSession[]> {
   const sessions: OutpostSession[] = [];
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
+  let pageNumber = 1;
 
   for (;;) {
     const cursorQuery = cursor === undefined ? "" : `&cursor=${encodeURIComponent(cursor)}`;
@@ -65,10 +66,23 @@ export async function listOutpostSessions(env: Env): Promise<OutpostSession[]> {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!response.ok) {
-      throw new Error(`Devin API returned ${response.status}: ${await response.text()}`);
+      // The page and running total tell an operator whether the API itself is
+      // down or one late page of a long listing failed.
+      throw new Error(
+        `Devin API returned ${response.status} on page ${pageNumber} ` +
+          `after ${sessions.length} sessions: ${await response.text()}`,
+      );
     }
 
-    const page = OutpostSessionPage.parse(await response.json());
+    let page: z.infer<typeof OutpostSessionPage>;
+    try {
+      page = OutpostSessionPage.parse(await response.json());
+    } catch (cause) {
+      const detail = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(
+        `Devin API page ${pageNumber} failed validation after ${sessions.length} sessions: ${detail}`,
+      );
+    }
     sessions.push(...page.items);
     if (page.has_next_page !== true) return sessions;
 
@@ -80,5 +94,6 @@ export async function listOutpostSessions(env: Env): Promise<OutpostSession[]> {
     }
     seenCursors.add(page.cursor);
     cursor = page.cursor;
+    pageNumber++;
   }
 }
