@@ -121,7 +121,7 @@ async function reconcileSession(
     return;
   }
 
-  const stub = env.DEVIN_SESSION.getByName(sessionId);
+  const stub = env.DEVIN_SESSION.getByName(sessionId, { locationHint: "enam" });
   if (command === "ensureRunning") {
     await stub.ensureRunning(
       sessionId,
