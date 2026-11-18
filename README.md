@@ -12,18 +12,18 @@ You need a Devin outpost ID and a Devin service user token with the **Run outpos
 
 The Deploy flow asks for `DEVIN_OUTPOST_ID` and `DEVIN_API_TOKEN`, then creates the Worker, its cron trigger, the Durable Object namespace, and the Container image.
 
-To deploy from your machine instead, you need Node.js 24 and a running Docker daemon:
+To deploy from your machine instead, you need Node.js 24, pnpm, and a running Docker daemon:
 
 ```sh
-npm create cloudflare@latest -- devin-outpost --template=cloudflare/sandbox-sdk/templates/devin
+pnpm create cloudflare@latest -- devin-outpost --template=cloudflare/sandbox-sdk/templates/devin
 cd devin-outpost
 ```
 
 Set `DEVIN_OUTPOST_ID` in `wrangler.jsonc`, then add the token and deploy:
 
 ```sh
-npx wrangler secret put DEVIN_API_TOKEN
-npm run deploy
+pnpm exec wrangler secret put DEVIN_API_TOKEN
+pnpm run deploy
 ```
 
 ## How it works
@@ -32,14 +32,26 @@ A cron trigger runs the Worker every minute. Each run polls the Devin API every 
 
 The Worker maps each session status to a call on that session's Durable Object:
 
-| Devin status         | Durable Object action                                                                |
-| -------------------- | ------------------------------------------------------------------------------------ |
-| `pending`, `running` | Start the Container if it is not running, from the session's snapshot if one exists. |
-| `suspended`          | Wait for the Devin CLI to exit, snapshot the Container, then destroy it.             |
-| `terminated`         | Destroy the Container and forget the snapshot.                                       |
-| Anything else        | Log the status and do nothing.                                                       |
+| Devin status         | Durable Object action                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `pending`, `running` | Start the Container if it is not running: environment snapshot for new sessions, session snapshot for resumes.     |
+| `suspended`          | Wait for the Devin CLI to exit, snapshot the Container, then destroy it.                                           |
+| `terminated`         | Destroy the Container and forget the snapshot.                                                                     |
+| Anything else        | Log the status and do nothing.                                                                                     |
 
 Inside the Container, `devin worker start` claims the session and runs it. The Durable Object never calls Devin.
+
+Each reconcile also logs the queue entry's `spec` (`kind`, `image_build`, whether `image`/`image_target` are set) as `devin.session.spec`, and `devin.container.started` records which filesystem source booted the session (`base`, `environment`, or `session`).
+
+## Environment snapshots
+
+When Devin's environment feature is on, it enqueues a session with `spec.image_build: true` after each environment build. That session exists to run the org's blueprint (repo clone, initialize, maintenance) rather than an agent, so this Worker treats it specially:
+
+- It always boots the **base** Container image — a build must run on a clean box, never on a previous environment snapshot (mirroring the k8s operator, which runs image-build pods from the pool's `image_build.base_image`).
+- When the Devin CLI exits with status 0, the Durable Object scrubs credential and per-session state (see Security), snapshots the Container, and stores the snapshot ID in the `EnvironmentImage` singleton Durable Object (`getByName("current")`). A nonzero exit destroys the Container without promoting a snapshot; both outcomes are logged (`devin.environment_image.saved` / `.failed`).
+- Every later session with `spec.kind === "new"` boots that snapshot instead of the base image. Resumed sessions (`spec.kind === "resume"`) keep using their own per-session snapshot. Only the latest environment snapshot is kept; Cloudflare expires container snapshots after 30 days, so a stale entry is replaced by the next successful build.
+
+`spec.image` (a registry digest the session must run) and `spec.image_target`/`image_target_path` (where the k8s operator would push a built image) are parsed and logged, but this template cannot pull arbitrary registry images or push to a registry — image builds here produce a Cloudflare snapshot instead. A session carrying `spec.image` logs `devin.session.image_unsupported` and still runs on the pool's image.
 
 ## Snapshots
 
@@ -63,7 +75,8 @@ Terminating a session removes the snapshot ID from the Durable Object. The Worke
 
 ## Security
 
-- Each Container receives `DEVIN_API_TOKEN`, because the Devin CLI needs it to claim the session. Code that Devin runs in the Container can read it.
+- Each Container receives `DEVIN_API_TOKEN`, because the Devin CLI needs it to claim the session. Code that Devin runs in the Container can read it. The token is passed through the process environment only; `start-devin-worker` never writes it to disk.
+- The environment snapshot is shared by every new session, so before it is taken the Container is scrubbed of credential and per-session state: `/root/.devin-worker` (the worker's cache and per-session state dir, including the downloaded `devin-remote` binary), `/root/.devin`, `/root/.config/devin` and `/root/.config/gcloud`, cloud and registry credential directories (`.ssh`, `.aws`, `.azure`, `.kube`, `.docker`, `.gnupg`), credential files (`.npmrc`, `.netrc`, `.git-credentials`), shell and Python history files, `/var/lib/devin`, the exit marker, and everything under `/tmp`. Repositories, installed packages, and toolchains the blueprint produced are kept.
 - Devin runs as root with passwordless `sudo` and Internet access. Use separate deployments for work that must not share a token or an account.
 - The Worker answers only `GET /`, for health checks.
 
@@ -72,6 +85,16 @@ Terminating a session removes the snapshot ID from the Durable Object. The Worke
 ```sh
 cp .dev.vars.example .dev.vars
 # Set DEVIN_API_TOKEN in .dev.vars and DEVIN_OUTPOST_ID in wrangler.jsonc.
-npm run dev
+pnpm install
+pnpm run dev
 curl "http://localhost:8787/cdn-cgi/local/scheduled"
+```
+
+## Development
+
+```sh
+pnpm install
+pnpm run typecheck   # tsc --noEmit
+pnpm test            # vitest unit tests
+pnpm run deploy      # wrangler deploy (builds the Container image with Docker)
 ```

@@ -3,6 +3,7 @@ import type { Env } from "./env";
 import { describeError } from "./session";
 
 export { DevinSession } from "./session";
+export { EnvironmentImage } from "./environment";
 
 // Matches the cron trigger in wrangler.jsonc. Polls stay inside this window so runs never overlap.
 const SCHEDULE_INTERVAL_MS = 60_000;
@@ -96,6 +97,19 @@ async function reconcileSession(
     });
     return;
   }
+  // Structured record of the queue spec on every reconcile: confirms whether
+  // Devin enqueues image_build sessions for this pool and whether spec.image
+  // pins are in use. No secrets are logged.
+  console.log({
+    event: "devin.session.spec",
+    sessionId,
+    kind: session.spec?.kind ?? null,
+    imageBuild: session.spec?.image_build === true,
+    imageSet: session.spec?.image != null,
+    imageTargetSet:
+      session.spec?.image_target != null || session.spec?.image_target_path != null,
+  });
+
   const command = status === undefined ? undefined : SESSION_COMMANDS.get(status);
   if (command === undefined) {
     console.warn({
@@ -109,7 +123,11 @@ async function reconcileSession(
 
   const stub = env.DEVIN_SESSION.getByName(sessionId);
   if (command === "ensureRunning") {
-    await stub.ensureRunning(sessionId, `${env.WORKER_ID_PREFIX || "cf-outpost"}-${sessionId}`);
+    await stub.ensureRunning(
+      sessionId,
+      `${env.WORKER_ID_PREFIX || "cf-outpost"}-${sessionId}`,
+      session.spec ?? null,
+    );
   } else if (command === "suspend") {
     await stub.suspend(sessionId);
   } else {

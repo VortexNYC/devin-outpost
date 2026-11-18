@@ -1,17 +1,61 @@
 import { DurableObject } from "cloudflare:workers";
+import type { SessionSpec } from "./devin-api";
 import type { Env } from "./env";
+import { chooseStartSource } from "./start-source";
 
 // The reconciler renews this on every poll, so it only matters after polling stops.
 const INACTIVITY_TIMEOUT_MS = 15 * 60 * 1_000;
-// start-devin-worker writes this file when the Devin CLI exits and then keeps the Container running.
+// start-devin-worker writes the Devin CLI's exit status here when it exits
+// and then keeps the Container running so it can be snapshotted.
 const EXIT_MARKER = "/var/lib/devin-outpost/exited";
 const SNAPSHOT_KEY = "snapshotId";
+const SESSION_META_KEY = "sessionMeta";
+
+// Removed before an environment snapshot is taken. The snapshot is shared by
+// every new session on the pool, so it must not carry credentials or
+// per-session state: DEVIN_API_TOKEN itself only ever lives in the process
+// environment (start-devin-worker never writes it), but the Devin CLI and
+// blueprints can persist secrets under HOME, and worker/session state lives
+// under /root/.devin-worker (the worker's cache dir and per-session state
+// dir, see WORKER_DATA_SUBDIR in the k8s operator's pod contract).
+const ENVIRONMENT_SCRUB_COMMAND = [
+  "rm -rf",
+  "/root/.devin-worker",
+  "/root/.devin",
+  "/root/.config/devin",
+  "/root/.config/gcloud",
+  "/root/.cache",
+  "/root/.ssh",
+  "/root/.aws",
+  "/root/.azure",
+  "/root/.kube",
+  "/root/.docker",
+  "/root/.gnupg",
+  "/root/.npmrc",
+  "/root/.netrc",
+  "/root/.git-credentials",
+  "/root/.bash_history",
+  "/root/.python_history",
+  "/root/.wget-hsts",
+  "/var/lib/devin",
+  "/var/lib/devin-outpost/exited",
+  "&& find /tmp -mindepth 1 -delete",
+].join(" ");
 
 export type SuspendResult = "saved" | "waiting" | "stopped";
 
+interface SessionMeta {
+  kind: string | null;
+  imageBuild: boolean;
+}
+
 /** One Durable Object per Devin session. It controls that session's Container and never calls Devin. */
 export class DevinSession extends DurableObject<Env> {
-  async ensureRunning(sessionId: string, acceptorId: string): Promise<void> {
+  async ensureRunning(
+    sessionId: string,
+    acceptorId: string,
+    spec?: SessionSpec | null,
+  ): Promise<void> {
     const container = this.requireContainer();
     if (container.running) {
       // A running session whose CLI exited needs a new Container. Keep its disk first.
@@ -21,7 +65,32 @@ export class DevinSession extends DurableObject<Env> {
       }
     }
 
-    const snapshotId = await this.ctx.storage.get<string>(SNAPSHOT_KEY);
+    const meta: SessionMeta = {
+      kind: spec?.kind ?? null,
+      imageBuild: spec?.image_build === true,
+    };
+    await this.ctx.storage.put(SESSION_META_KEY, meta);
+    if (spec?.image != null) {
+      // spec.image pins a registry digest this template cannot pull; the
+      // session still runs on the pool's image and the build logs show it.
+      console.warn({
+        event: "devin.session.image_unsupported",
+        sessionId,
+        image: spec.image,
+      });
+    }
+
+    const sessionSnapshotId = await this.ctx.storage.get<string>(SNAPSHOT_KEY);
+    const environment = meta.imageBuild
+      ? null
+      : await this.env.ENVIRONMENT_IMAGE.getByName("current").current();
+    const decision = chooseStartSource({
+      kind: meta.kind,
+      imageBuild: meta.imageBuild,
+      sessionSnapshotId,
+      environmentSnapshotId: environment?.snapshotId,
+    });
+
     const env = {
       DEVIN_OUTPOST_SESSION_ID: sessionId,
       DEVIN_OUTPOST_ID: this.env.DEVIN_OUTPOST_ID,
@@ -42,16 +111,19 @@ export class DevinSession extends DurableObject<Env> {
       enableInternet: true,
       env,
     } satisfies ContainerStartupOptions;
-    if (snapshotId === undefined) {
+    if (decision.source === "base") {
       container.start({ ...options, image: container.images.devin });
     } else {
-      container.start({ ...options, containerSnapshot: { id: snapshotId } });
+      container.start({ ...options, containerSnapshot: { id: decision.snapshotId } });
     }
     await container.setInactivityTimeout(INACTIVITY_TIMEOUT_MS);
     console.log({
       event: "devin.container.started",
       sessionId,
-      fromSnapshot: snapshotId !== undefined,
+      source: decision.source,
+      kind: meta.kind,
+      imageBuild: meta.imageBuild,
+      snapshotId: decision.source === "base" ? undefined : decision.snapshotId,
     });
     this.ctx.waitUntil(
       container.monitor().then(
@@ -79,21 +151,77 @@ export class DevinSession extends DurableObject<Env> {
     console.log({ event: "devin.session.terminated", sessionId });
   }
 
-  private async saveIfExited(container: Container, sessionId: string): Promise<boolean> {
-    const probe = await container.exec(["test", "-e", EXIT_MARKER]);
-    const { exitCode } = await probe.output();
-    if (exitCode !== 0) return false;
+  // Returns the CLI's exit status once the exit marker exists, undefined while the CLI still runs.
+  private async exitedStatus(container: Container): Promise<number | undefined> {
+    const probe = await container.exec(["cat", EXIT_MARKER]);
+    const { exitCode, stdout } = await probe.output();
+    if (exitCode !== 0) return undefined;
+    const status = Number(new TextDecoder().decode(stdout).trim());
+    return Number.isInteger(status) ? status : -1;
+  }
 
-    const snapshot = await container.snapshotContainer({ name: `devin-${sessionId}` });
-    await this.ctx.storage.put(SNAPSHOT_KEY, snapshot.id);
+  private async saveIfExited(container: Container, sessionId: string): Promise<boolean> {
+    const exitStatus = await this.exitedStatus(container);
+    if (exitStatus === undefined) return false;
+
+    const meta = await this.ctx.storage.get<SessionMeta>(SESSION_META_KEY);
+    if (meta?.imageBuild === true) {
+      await this.captureEnvironmentImage(container, sessionId, exitStatus);
+    } else {
+      const snapshot = await container.snapshotContainer({ name: `devin-${sessionId}` });
+      await this.ctx.storage.put(SNAPSHOT_KEY, snapshot.id);
+      await container.destroy();
+      console.log({
+        event: "devin.snapshot.saved",
+        sessionId,
+        snapshotId: snapshot.id,
+        bytes: snapshot.size,
+      });
+    }
+    return true;
+  }
+
+  // An image-build session's disk becomes the pool's environment snapshot.
+  // Success is the Devin CLI exiting 0 — the same signal the k8s operator gets
+  // from the worker container's exit status driving the pod to Succeeded.
+  private async captureEnvironmentImage(
+    container: Container,
+    sessionId: string,
+    exitStatus: number,
+  ): Promise<void> {
+    if (exitStatus !== 0) {
+      await container.destroy();
+      console.warn({
+        event: "devin.environment_image.failed",
+        sessionId,
+        exitStatus,
+      });
+      return;
+    }
+
+    const scrub = await container.exec(["sh", "-c", ENVIRONMENT_SCRUB_COMMAND]);
+    const scrubResult = await scrub.output();
+    if (scrubResult.exitCode !== 0) {
+      console.warn({
+        event: "devin.environment_image.scrub_failed",
+        sessionId,
+        exitCode: scrubResult.exitCode,
+      });
+    }
+
+    const snapshot = await container.snapshotContainer({ name: `devin-env-${sessionId}` });
+    await this.env.ENVIRONMENT_IMAGE.getByName("current").record({
+      snapshotId: snapshot.id,
+      buildSessionId: sessionId,
+      createdAt: Date.now(),
+    });
     await container.destroy();
     console.log({
-      event: "devin.snapshot.saved",
+      event: "devin.environment_image.saved",
       sessionId,
       snapshotId: snapshot.id,
       bytes: snapshot.size,
     });
-    return true;
   }
 
   private requireContainer(): Container {

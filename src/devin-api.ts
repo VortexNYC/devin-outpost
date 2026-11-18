@@ -3,11 +3,35 @@ import type { Env } from "./env";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// Mirrors `Spec` in CognitionAI/devin-outpost-k8s src/api/types.rs. Unknown
+// keys are kept (looseObject) so a server-side addition never breaks parsing;
+// `kind` stays a plain string because the server may add variants.
+const SessionSpec = z.looseObject({
+  kind: z.string().nullish(),
+  platform: z.string().nullish(),
+  remote_binary_sha: z.string().nullish(),
+  // Container image digest the session must run; the pool's worker image when unset.
+  image: z.string().nullish(),
+  // True when the session exists to build the pool's next environment image.
+  image_build: z.boolean().nullish(),
+  // `repository/path:tag` the built image is pushed to (k8s registry flow).
+  image_target: z.string().nullish(),
+  // `path:tag` under the pool's image repository for the built image.
+  image_target_path: z.string().nullish(),
+  network_policy: z
+    .looseObject({
+      enabled: z.boolean().nullish(),
+      allow: z.array(z.unknown()).nullish(),
+    })
+    .nullish(),
+});
+
 const OutpostSession = z.object({
   metadata: z.object({
     session_id: z.string().min(1),
     outpost_id: z.string(),
   }),
+  spec: SessionSpec.nullish(),
   status: z
     .object({
       session_status: z.string().nullish(),
@@ -22,7 +46,9 @@ const OutpostSessionPage = z.object({
   has_next_page: z.boolean().nullish(),
 });
 
+export { OutpostSession };
 export type OutpostSession = z.infer<typeof OutpostSession>;
+export type SessionSpec = z.infer<typeof SessionSpec>;
 
 // Lists every session for the configured outpost, following Devin's pagination cursor.
 export async function listOutpostSessions(env: Env): Promise<OutpostSession[]> {
